@@ -1,192 +1,164 @@
-# Distributed Word2Vec (SGNS) Implementation Notes
+# Distributed ResNet Training (DDP) - Practical Implementation Notes
 
-## Goal
+## Why this topic now
 
-Implement a practical, interview-ready version of **Word2Vec Skip-gram with Negative Sampling (SGNS)** that explicitly models distributed training constraints.
+ResNet is a foundational vision architecture, and distributed data-parallel training is the production default for scaling it.
+This artifact connects model understanding (residual blocks) with distributed systems realities (synchronization cost, process coordination, throughput bottlenecks).
 
-This note focuses on system design decisions, not just model equations.
-
----
-
-## 1) Problem framing
-
-Classic SGNS is simple on one machine but expensive at scale because:
-
-- embedding tables are huge (vocab can be millions)
-- updates are sparse but frequent
-- communication dominates compute in distributed settings
-
-For ML Engineer/MLOps roles, the key is balancing **throughput**, **convergence quality**, and **operational simplicity**.
+For ML Engineer / MLOps roles, this is a high-signal combination: model + systems.
 
 ---
 
-## 2) SGNS recap (minimal math)
+## 1) ResNet refresher (what matters in practice)
 
-For center word `w` and context word `c`, maximize:
+Core idea from *Deep Residual Learning for Image Recognition*:
 
-- `log sigma(v_w · u_c)` for positive pairs
-- `sum_k log sigma(-v_w · u_nk)` for negative samples
+- learn residual function `F(x)` and add skip path: `y = F(x) + x`
+- easier optimization for deep networks
+- better gradient flow compared to plain deep stacks
 
-where:
+Operationally important:
 
-- `v_*` are input embeddings
-- `u_*` are output embeddings
-
-Properties:
-
-- sparse row updates (only touched tokens update)
-- highly parallelizable
-- communication hotspots on frequent words
+- residual connections allow deeper models without severe degradation
+- deeper model = more compute + potentially more communication under DDP
 
 ---
 
-## 3) Distributed design options
+## 2) DDP topology and process model
 
-## A) Parameter server (PS), async updates
+Definitions:
 
-How it works:
+- **world size**: total training processes
+- **rank**: unique process id
+- **local rank**: GPU index on node
 
-- shard embedding rows across parameter servers
-- workers pull required rows, compute gradients, push updates asynchronously
+DDP mechanics:
 
-Pros:
+1. each rank holds full model replica
+2. each rank gets unique mini-batch shard (`DistributedSampler`)
+3. backward pass triggers gradient all-reduce
+4. optimizer step stays consistent due to synchronized grads
 
-- high throughput
-- naturally supports sparse updates
-- easy horizontal scaling for workers
-
-Cons:
-
-- stale gradients (workers read old params)
-- hotspot shards for common tokens
-- convergence sensitivity to lag/skew
-
-Best when:
-
-- latency/throughput prioritized
-- slight optimization noise is acceptable
-
-## B) Synchronous all-reduce
-
-How it works:
-
-- each worker computes gradients on local batch
-- global gradient synchronization every step (or micro-step)
-
-Pros:
-
-- cleaner optimization semantics
-- deterministic-ish across runs
-- easier debugging of convergence
-
-Cons:
-
-- expensive synchronization barriers
-- inefficient for ultra-sparse updates unless heavily optimized
-- straggler sensitivity
-
-Best when:
-
-- model quality reproducibility matters most
-- cluster/network is stable and high-bandwidth
+Important implication:
+- communication cost grows with model size and gradient volume
 
 ---
 
-## 4) Recommendation for Word2Vec at production scale
+## 3) Correct baseline checklist
 
-For SGNS-style sparse embedding training, start with:
+- initialize `torch.distributed` process group
+- set CUDA device from local rank
+- wrap model with `DistributedDataParallel`
+- use `DistributedSampler` and call `set_epoch(epoch)`
+- keep logging/checkpoint writes to rank 0
+- destroy process group on clean exit
 
-- **sharded parameter server + bounded staleness**
-- token-frequency-aware partitioning
-- adaptive learning rate per shard
-- optional periodic sync checkpoints to reduce drift
-
-Reason: sparse updates benefit more from asynchronous sharded access than strict step-level all-reduce.
-
----
-
-## 5) Data and sampling pipeline
-
-Pipeline stages:
-
-1. tokenize corpus and build vocab with min-frequency threshold
-2. subsample very frequent words (`t / f(w)` heuristic)
-3. generate (center, context) pairs via sliding window
-4. negative sample by smoothed unigram (`f(w)^0.75`)
-5. dispatch batches to workers
-
-Distributed concerns:
-
-- keep negative sampler statistically consistent across workers
-- cache alias tables per worker and refresh periodically
-- track per-worker token skew to detect imbalance
+Without these, results are often incorrect or unstable.
 
 ---
 
-## 6) Sharding strategy details
+## 4) Global batch and learning-rate scaling
 
-Base strategy:
+Global batch:
 
-- consistent hash by token id -> shard
+`global_batch = per_gpu_batch * world_size`
 
-Improvements:
+Common practical rule:
+- if global batch increases `k` times, start by scaling LR by `k` (then tune)
+- add warmup for stability in larger-batch training
 
-- separate heavy hitters into dedicated shard classes
-- replicate top-K frequent output rows for read-heavy paths
-- use asynchronous write coalescing for frequent tokens
-
-Watch metrics:
-
-- per-shard QPS
-- queue depth
-- update staleness window
-- hot-token concentration
+Watchouts:
+- blindly scaling LR can diverge
+- gradient accumulation may be needed when per-GPU memory is tight
 
 ---
 
-## 7) Correctness and quality risks
+## 5) Throughput bottlenecks in distributed ResNet
 
-- stale reads create optimizer noise
-- delayed updates can overfit local minibatch distribution
-- uneven shard load slows tail workers
-- negative sampler drift changes effective objective
+Most common bottlenecks:
+
+1. data pipeline too slow (CPU decode/augmentation)
+2. communication overhead (all-reduce) dominates step
+3. sync points from frequent logging or host-device transfers
+4. unbalanced workers causing stragglers
+
+High-ROI fixes:
+
+- mixed precision (AMP)
+- larger per-rank batch if memory permits
+- optimized dataloader workers + pinned memory
+- reduce unnecessary synchronization in hot loop
+
+---
+
+## 6) Reliability and failure modes
+
+### A) Deadlocks/hangs
+Causes:
+- uneven number of batches across ranks
+- one rank crashes while others wait in collectives
 
 Mitigations:
+- use `DistributedSampler(drop_last=True)` for strict alignment
+- add timeout-aware launch and robust error propagation
 
-- bounded staleness limit
-- gradient clipping
-- periodic global eval on analogy/similarity set
-- shard rebalancing by observed load
+### B) Checkpoint corruption/inconsistency
+Mitigations:
+- only rank 0 writes checkpoints
+- atomic write (temp file then rename)
+- store model/optimizer/scaler/epoch metadata
+
+### C) Numerical instability
+Mitigations:
+- AMP with GradScaler
+- gradient clipping when needed
+- monitor loss for NaN/Inf and fail fast
 
 ---
 
-## 8) What to measure (must-have)
+## 7) What to measure (must-have)
 
 System metrics:
 
-- tokens/sec per worker
-- network bytes/sec per shard
-- p95 pull/push latency
-- staleness distribution (steps behind)
+- samples/sec (per rank + global)
+- step time p50/p95
+- GPU utilization
+- dataloader wait time
+- communication overhead proxy (step time increase with more GPUs)
 
 Model metrics:
 
-- training loss trend
-- nearest-neighbor quality checks
-- downstream task proxy (if available)
+- training/validation loss
+- top-1 accuracy
+- convergence speed per wall-clock hour
 
-Decision trigger example:
-
-- if throughput high but quality plateaus early, reduce staleness or increase sync frequency.
+If speedup is poor, diagnose data/comm bottleneck before changing model depth.
 
 ---
 
-## 9) What this folder contains
+## 8) Suggested experiment matrix
 
-- `sgns_distributed.py`
-- compact SGNS skeleton
-- sharded embeddings
-- pluggable sync modes: `async_ps`, `sync_allreduce`
-- simple instrumentation for update counts and remap skew
+Minimal but convincing:
 
-Use this as a systems-thinking artifact, not a final production trainer.
+1. 1 GPU baseline (no DDP)
+2. 2 GPU DDP, same per-GPU batch
+3. 2 GPU DDP + AMP
+4. compare:
+- throughput gain
+- final accuracy parity
+- resource utilization
+
+This gives interview-ready evidence of systems thinking.
+
+---
+
+## 9) Scope of this repo implementation
+
+`train_resnet_ddp.py` intentionally keeps model/data simple so the distributed mechanics are clear and runnable on limited hardware.
+
+Next upgrades:
+
+- switch to torchvision ResNet18/34 on CIFAR-10 or ImageNet subset
+- add profiler traces
+- add multi-node launch documentation
+- add experiment tracking integration (MLflow/W&B)
